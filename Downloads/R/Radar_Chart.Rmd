@@ -1,0 +1,209 @@
+---
+title: "Radar_chart"
+author: "Sam Gray"
+date: "2024-12-06"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(worldfootballR)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+#install.packages("fmsb")
+library(fmsb)
+```
+
+Reading in each dataset. There were five data sets: Standard, Defense, Passing, Possession, and Miscellaneous. I selected the variable(s) I wanted from each data frame and filtered out the rest. Each data frame is also filtered to return only midfielders. All of the data is for the 23/24 season, which isn't entirely useful now.
+```{r}
+standard <- load_fb_big5_advanced_season_stats(season_end_year = 2024,
+                                                         stat_type = "standard",
+                                                         team_or_player = "player")
+myStandard <- standard %>%
+  filter(Pos == "MF") %>%
+  select(Squad, Comp, Player, Min_Playing, npxG_Expected, xAG_Expected, PrgP_Progression, PrgC_Progression)
+
+
+defense <- load_fb_big5_advanced_season_stats(season_end_year = 2024,
+                                                      stat_type = "defense",
+                                                      team_or_player = "player")
+MFdefense <- defense %>%
+  filter(Pos == "MF") %>%
+  select(Player, TklW_Tackles, Blocks_Blocks, Int)
+
+
+passing <- load_fb_big5_advanced_season_stats(season_end_year = 2024,
+                                                      stat_type = "passing",
+                                                      team_or_player = "player")
+MFpassing <- passing %>%
+  filter(Pos == "MF") %>%
+  select(Player, Cmp_percent_Total, KP)
+
+misc <- load_fb_big5_advanced_season_stats(season_end_year = 2024,
+                                            stat_type = "misc",
+                                            team_or_player = "player")
+myMisc <- misc %>%
+  filter(Pos == "MF") %>%
+  select(Player, Won_Aerial)
+```
+Now, I bind the variables of interest into one data frame. The original data frame was standard, with the variables from the other four data frames tacked on. Then, I rename the variables to something more readable, select the variables in the order I want them to appear on the radar chart, and filter the 576 observations down to 391, by selecting the players who played at least 10 full games (900 minutes).
+
+Let's run through the variables: The first 3 identify the player. 
+`Non-Pen xG` is the non-penalty goals they were expected to score. 'expected' stats are very complicated to calculate, but simply put this is a metric of how well   they are at getting goals.
+`xA` is their expected assists, which is a metric for how many chances they are creating. Again, attacking.
+`Prg Passes` is the number of progressive passes they have made atleast 10 yards further than the previous 6, or any into the penalty area.
+`Prg Carries` is the same, but with the ball at their feet instead.
+`Aerials Won` measures how many aerial duels they are winning. High numbers here can measure attacking and defending strength.
+`Blocks` is a defensive stat, counts the times they blocked the ball by standing in its path.
+`Tackles Won` measures how many time they won possession from a tackle.
+`Int` is interceptions, where the player regained possession from an opposing players pass.
+`Completion Percent` is their overall pass completion percent. Tricky metric, those who have 100% pass completion could only play safe passes, those with 0% could be     trying to create forward chances.
+`Key Passes` are passes that lead directly to a shot (assisted shot).
+```{r}
+newStats <- myStandard %>%
+  cbind(MFdefense[,-1], MFpassing[, -1], "Won_Aerial" = myMisc[, -1]) %>%
+  rename('Non-pen xG' = npxG_Expected,
+         xA = xAG_Expected,
+         'Prg Passes' = PrgP_Progression,
+         'Prg Carries'  = PrgC_Progression,
+         'Tackles Won' = TklW_Tackles,
+         Blocks = Blocks_Blocks,
+         'Completion Percent' = Cmp_percent_Total,
+         'Key Passes' = KP,
+         'Aerials Won' = Won_Aerial
+         ) %>%
+  select(Squad, Comp, Player, Min_Playing, 'Non-pen xG', xA, 'Prg Passes', 'Prg Carries', 'Aerials Won', Blocks, 'Tackles Won', Int, 'Completion Percent', 'Key Passes') %>%
+  filter(Min_Playing > 400)
+```
+Now, I turn each stat into per 90. To do this, I multiply each stat by 90, then divide it by the number of minutes played. I use `mutate()` and `across()` to mutate across the variables the conditions I want. Next, I do something very similar as the previous step, but now I standardize the data. I use the same two functions as before, as well as `rank` to rank each entry and then divide it by the number of entries (333).
+```{r}
+stats <- newStats %>%
+  mutate(across(5:14, ~ (.x * 90) / Min_Playing)) %>% # standardize to per 90
+  mutate(across(5:14, ~ rank(.x, ties.method = "average") / length(.x) * 100)) %>% # percentile
+  mutate(across(5:14, ~ round(.x, 2))) # rounding values for easier viewing
+head(stats)
+```
+
+Now, we can have fun with this standardized data frame. For example, we can arrange different variables in descending order to see who ranks highest. I'm gonna have some fun with that. Also, I can make a new variable, that is the average percentile rank of each stat, then rank in descending order, so to show who has the highest average stats. This isn't very useful from an analytics point of view, since different midfielders are expected to have different attributes (think of more attack minded and more defense minded), and to show the quality of a midfield is to show how different midfield pairings work together.
+
+```{r}
+exampleStats <- stats %>%
+  arrange(desc(`Aerials Won`))
+```
+
+Building the radar chart and completeness score. This is just a function, and would be much nicer in an Rshiny dashboard. Some things to note is the completeness calculation. This takes the maximum value of each variable, and averages it. This is to show the strengths of the overall midfield. However, this doesn't necessarily show how 'complete' a midfield is. It is instead the average rating of the midfield. When creating the data, we take the dataset from before and append a row of 0 and a row of 100, which are parameters the fmsb package requires. Something visual to note is that the opacity (alpha) of the fill colors is made to lower once we have more than 2 players, which keeps the radar chart readable.
+```{r}
+mfRadar <- function(data, mf1, mf2 = NULL, mf3 = NULL, mf4 = NULL, name = 'Midfield') {
+
+  #checks all players entered
+players <- c(mf1, mf2, mf3, mf4)
+players <- players[!is.null(players)] #remove any null values
+  
+#creates a dataframe, playerData, that is the name of the players entered plus their metrics
+playerData <- data %>%
+  filter(Player %in% players) %>%
+  arrange(match(Player, players)) %>%
+  select(5:14)
+
+#completeness score
+completeness <- playerData %>%
+  summarize(across(everything(), max)) %>%
+  rowMeans() %>%
+  round(1)
+
+# data for the radar chart, has to have 0 row then 100 row for the chart function
+radarData <- rbind(
+  rep(100, ncol(playerData)), #Max
+  rep(0, ncol(playerData)), #Min
+  playerData
+  )
+
+#changing var_names for easier readability
+var_names <- colnames(playerData)
+var_names <- gsub(' ', '\n', var_names)
+
+#setting the line colors
+pcol_colors = c(
+    "#1F77B4FF",  # Muted blue
+    "#FF7F0EFF",  # Safety orange
+    "#2CA02CFF",  # Cooked asparagus green
+    "#D62728FF"   # Brick red
+) [1:length(playerData)]
+
+#setting the fill colors, reducing the opacity (alpha) if too many players are entered
+alpha <- if(length(players) > 2) 0.5 else 0.6
+pfcol_colors <- sapply(pcol_colors, function(col){
+  adjustcolor(col, alpha.f = alpha)
+})
+
+# margins - idk what this does
+op <- par(mar = c(1, 1, 3, 1),  # Bottom, Left, Top, Right margins
+            oma = c(0, 0, 0, 3),   # Outer margin for legend space
+            cex = 0.8)
+
+#creating the radar chart
+radarchart(
+  radarData,
+  seg = 4,
+  pcol = pfcol_colors,
+  pfcol = pfcol_colors,
+  plwd = 4,
+  plty = 1,
+  cglty = 1,
+  cglcol = "#a8a8a8",
+  cglwd = 1.5,
+  title = name,
+  vlcex = 1.18,
+  calcex = 1.1,
+  vlabels = var_names,
+  cex.main = 1.1
+)
+
+#adding a legend in the top right
+legend(
+  x = "topright",
+  legend = players,
+  bty = 'n',
+  xpd = NA,
+  inset = c(-.05, -.05),
+  fill = pfcol_colors,
+  border = pcol_colors,
+  title = "Players",
+  cex = 1.25
+)
+
+#pasting the completeness score across onto the chart
+text(
+  x = 1.3,
+  y = -1, 
+  labels = paste("Completeness:", completeness),  
+  xpd = NA,
+  adj = 0,
+  cex = 1.3,
+  font = 2
+)
+
+par(op)
+}
+
+```
+
+``` {r}
+mfRadar(stats,'Kevin De Bruyne', 'Florian Wirtz', 'Xavi Simons')
+mfRadar(stats, 'Kevin De Bruyne', 'Rodri', 'Mateo Kovačić', name = 'Manchester City')
+mfRadar(stats, 'Dominik Szoboszlai', 'Alexis Mac Allister', 'Wataru Endo', name = "Liverpool")
+mfRadar(stats, 'Jorginho', 'Martin Ødegaard', 'Declan Rice', name = 'Arsenal')
+mfRadar(stats, 'Kevin De Bruyne', 'Mikel Merino', 'Alexis Mac Allister', name = 'Sams Midfield')
+```
+
+These are all just examples of combinations, but really this is meant to be interactive, and we can add whoever we want to create whichever midfield we want. Some areas for improvement include using Rshiny to make a dashboard, scraping data from this season for more important insights, and binding market value to be able to consider price in creating this midfield. A far fetched idea that I could work on would be to implement budget and current players as parameters, then use some sort of ML algorithm to return the top players that have the profile you need. I'm excited to work on this more!
+
+
+
+
+
+
+
+
